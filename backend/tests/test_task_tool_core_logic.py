@@ -24,8 +24,11 @@ class FakeSubagentStatus(Enum):
     TIMED_OUT = "timed_out"
 
 
-def _make_runtime() -> SimpleNamespace:
+def _make_runtime(*, app_config=None) -> SimpleNamespace:
     # Minimal ToolRuntime-like object; task_tool only reads these three attributes.
+    context = {"thread_id": "thread-1"}
+    if app_config is not None:
+        context["app_config"] = app_config
     return SimpleNamespace(
         state={
             "sandbox": {"sandbox_id": "local"},
@@ -35,14 +38,14 @@ def _make_runtime() -> SimpleNamespace:
                 "outputs_path": "/tmp/outputs",
             },
         },
-        context={"thread_id": "thread-1"},
+        context=context,
         config={"metadata": {"model_name": "ark-model", "trace_id": "trace-1"}},
     )
 
 
-def _make_subagent_config() -> SubagentConfig:
+def _make_subagent_config(name: str = "general-purpose") -> SubagentConfig:
     return SubagentConfig(
-        name="general-purpose",
+        name=name,
         description="General helper",
         system_prompt="Base system prompt",
         max_turns=50,
@@ -112,6 +115,68 @@ def test_task_tool_rejects_bash_subagent_when_host_bash_disabled(monkeypatch):
     assert result.startswith("Error: Bash subagent is disabled")
 
 
+def test_task_tool_threads_runtime_app_config_to_subagent_dependencies(monkeypatch):
+    app_config = object()
+    config = _make_subagent_config(name="bash")
+    runtime = _make_runtime(app_config=app_config)
+    events = []
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            captured["prompt"] = prompt
+            return task_id or "generated-task-id"
+
+    def fake_get_available_subagent_names(*, app_config):
+        captured["names_app_config"] = app_config
+        return ["bash"]
+
+    def fake_get_subagent_config(name, *, app_config):
+        captured["config_lookup"] = (name, app_config)
+        return config
+
+    def fake_is_host_bash_allowed(config):
+        captured["bash_gate_app_config"] = config
+        return True
+
+    def fake_get_available_tools(**kwargs):
+        captured["tools_kwargs"] = kwargs
+        return ["tool-a"]
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_available_subagent_names", fake_get_available_subagent_names)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", fake_get_subagent_config)
+    monkeypatch.setattr(task_tool_module, "is_host_bash_allowed", fake_is_host_bash_allowed)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: events.append)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", fake_get_available_tools)
+
+    output = _run_task_tool(
+        runtime=runtime,
+        description="运行命令",
+        prompt="inspect files",
+        subagent_type="bash",
+        tool_call_id="tc-explicit-config",
+    )
+
+    assert output == "Task Succeeded. Result: done"
+    assert captured["names_app_config"] is app_config
+    assert captured["config_lookup"] == ("bash", app_config)
+    assert captured["bash_gate_app_config"] is app_config
+    assert captured["tools_kwargs"]["app_config"] is app_config
+    assert captured["executor_kwargs"]["app_config"] is app_config
+    assert captured["executor_kwargs"]["tools"] == ["tool-a"]
+
+
 def test_task_tool_emits_running_and_completed_events(monkeypatch):
     config = _make_subagent_config()
     runtime = _make_runtime()
@@ -156,7 +221,6 @@ def test_task_tool_emits_running_and_completed_events(monkeypatch):
         prompt="collect diagnostics",
         subagent_type="general-purpose",
         tool_call_id="tc-123",
-        max_turns=7,
     )
 
     assert output == "Task Succeeded. Result: all done"
@@ -164,7 +228,7 @@ def test_task_tool_emits_running_and_completed_events(monkeypatch):
     assert captured["task_id"] == "tc-123"
     assert captured["executor_kwargs"]["thread_id"] == "thread-1"
     assert captured["executor_kwargs"]["parent_model"] == "ark-model"
-    assert captured["executor_kwargs"]["config"].max_turns == 7
+    assert captured["executor_kwargs"]["config"].max_turns == config.max_turns
     # Skills are no longer appended to system_prompt; they are loaded per-session
     # by SubagentExecutor and injected as conversation items (Codex pattern).
     assert captured["executor_kwargs"]["config"].system_prompt == "Base system prompt"
@@ -221,6 +285,56 @@ def test_task_tool_propagates_tool_groups_to_subagent(monkeypatch):
     assert output == "Task Succeeded. Result: done"
     # The key assertion: groups should be propagated from parent metadata
     get_available_tools.assert_called_once_with(model_name="ark-model", groups=parent_tool_groups, subagent_enabled=False)
+
+
+def test_task_tool_uses_subagent_model_override_for_tool_loading(monkeypatch):
+    """Subagent model overrides should drive model-gated tool loading."""
+    config = SubagentConfig(
+        name="general-purpose",
+        description="General helper",
+        system_prompt="Base system prompt",
+        model="vision-subagent-model",
+        max_turns=50,
+        timeout_seconds=10,
+    )
+    runtime = _make_runtime()
+    runtime.config["metadata"]["model_name"] = "parent-text-model"
+    events = []
+    get_available_tools = MagicMock(return_value=[])
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            pass
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _: config)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: events.append)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", get_available_tools)
+
+    output = _run_task_tool(
+        runtime=runtime,
+        description="inspect image",
+        prompt="inspect the uploaded image",
+        subagent_type="general-purpose",
+        tool_call_id="tc-issue-2543",
+    )
+
+    assert output == "Task Succeeded. Result: done"
+    get_available_tools.assert_called_once_with(
+        model_name="vision-subagent-model",
+        groups=None,
+        subagent_enabled=False,
+    )
 
 
 def test_task_tool_inherits_parent_skill_allowlist_for_default_subagent(monkeypatch):
@@ -371,6 +485,8 @@ def test_task_tool_runtime_none_passes_groups_none(monkeypatch):
     monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: events.append)
     monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr("deerflow.tools.get_available_tools", get_available_tools)
+    fallback_app_config = SimpleNamespace(models=[SimpleNamespace(name="default-model")])
+    monkeypatch.setattr(task_tool_module, "get_app_config", lambda: fallback_app_config)
 
     output = _run_task_tool(
         runtime=None,
@@ -381,8 +497,13 @@ def test_task_tool_runtime_none_passes_groups_none(monkeypatch):
     )
 
     assert output == "Task Succeeded. Result: ok"
-    # runtime is None → metadata is empty dict → groups=None
-    get_available_tools.assert_called_once_with(model_name=None, groups=None, subagent_enabled=False)
+    # runtime is None -> metadata is empty dict -> groups=None, model falls back to app default.
+    get_available_tools.assert_called_once_with(
+        model_name="default-model",
+        groups=None,
+        subagent_enabled=False,
+        app_config=fallback_app_config,
+    )
 
     config = _make_subagent_config()
     events = []
